@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+#
+# git-publish - Automatically create a GitHub repository, set main branch, and push.
+# Usage: git publish [repo-name] [options]
+#        git-publish [repo-name] [options]
+#
+
+set -eo pipefail
+
+# ANSI color codes
+BOLD=$(printf '\033[1m')
+GREEN=$(printf '\033[0;32m')
+BLUE=$(printf '\033[0;34m')
+YELLOW=$(printf '\033[0;33m')
+RED=$(printf '\033[0;31m')
+CYAN=$(printf '\033[0;36m')
+NC=$(printf '\033[0m') # No Color
+
+# Helper log functions
+info()    { echo "${CYAN}➜${NC} $*"; }
+success() { echo "${GREEN}✔${NC} ${BOLD}$*${NC}"; }
+warn()    { echo "${YELLOW}▲${NC} $*"; }
+error()   { echo "${RED}✖${NC} ${BOLD}$*${NC}" >&2; }
+
+show_help() {
+  cat << EOF
+${BOLD}git-publish${NC} - Automatically create a GitHub repository and push to main.
+
+${BOLD}USAGE:${NC}
+  git publish [repo-name] [options]
+  git-publish [repo-name] [options]
+
+${BOLD}ARGUMENTS:${NC}
+  repo-name                 Name of the repository (defaults to current folder name)
+
+${BOLD}OPTIONS:${NC}
+  --public                  Create a public repository (default)
+  -p, --private             Create a private repository
+  -d, --description <desc>  Repository description
+  -m, --message <msg>       Commit message if uncommitted changes exist (default: "Initial commit")
+  --ssh                     Use SSH remote url (git@github.com:user/repo.git) (default)
+  --https                   Use HTTPS remote url (https://github.com/user/repo.git)
+  -y, --yes                 Skip interactive confirmations
+  -h, --help                Show this help message
+
+${BOLD}EXAMPLES:${NC}
+  git publish
+  git publish my-awesome-app
+  git publish android-cast-macos --private -d "Screen casting app for macOS"
+  git publish --public -m "feat: first release"
+EOF
+  exit 0
+}
+
+# Defaults
+REPO_NAME=""
+VISIBILITY=""
+DESCRIPTION=""
+COMMIT_MSG="Initial commit"
+PROTOCOL="ssh"
+ASSUME_YES=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      ;;
+    --public)
+      VISIBILITY="public"
+      shift
+      ;;
+    -p|--private)
+      VISIBILITY="private"
+      shift
+      ;;
+    -d|--description)
+      DESCRIPTION="$2"
+      shift 2
+      ;;
+    -m|--message)
+      COMMIT_MSG="$2"
+      shift 2
+      ;;
+    --ssh)
+      PROTOCOL="ssh"
+      shift
+      ;;
+    --https)
+      PROTOCOL="https"
+      shift
+      ;;
+    -y|--yes)
+      ASSUME_YES=true
+      shift
+      ;;
+    -*)
+      error "Unknown option: $1"
+      echo "Run 'git publish --help' for usage."
+      exit 1
+      ;;
+    *)
+      if [[ -z "$REPO_NAME" ]]; then
+        REPO_NAME="$1"
+      else
+        error "Unexpected extra argument: $1"
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Step 1: Check dependencies
+if ! command -v git &>/dev/null; then
+  error "git is not installed or not in PATH."
+  exit 1
+fi
+
+if ! command -v gh &>/dev/null; then
+  error "GitHub CLI ('gh') is not installed."
+  info "You can install it with: ${BOLD}brew install gh${NC}"
+  exit 1
+fi
+
+# Step 2: Check GitHub CLI authentication
+if ! gh auth status &>/dev/null; then
+  warn "You are not logged in to GitHub via 'gh' (or session expired)."
+  if [[ "$ASSUME_YES" = false ]] && [ -t 0 ]; then
+    printf "Would you like to log in now with 'gh auth login'? [Y/n] "
+    read -r login_choice
+    login_choice=${login_choice:-Y}
+    if [[ "$login_choice" =~ ^[Yy]$ ]]; then
+      gh auth login
+    else
+      error "GitHub authentication is required to create a repository."
+      exit 1
+    fi
+  else
+    error "Please run 'gh auth login' or 'gh auth refresh' to authenticate."
+    exit 1
+  fi
+fi
+
+# Fetch authenticated username
+GITHUB_USER=$(gh api user -q .login 2>/dev/null || true)
+if [[ -z "$GITHUB_USER" ]]; then
+  error "Failed to retrieve GitHub username from GitHub CLI."
+  exit 1
+fi
+
+# Helper function to extract a string field from package.json
+get_package_json_field() {
+  local field="$1"
+  if [[ ! -f "package.json" ]]; then
+    return 1
+  fi
+
+  local val=""
+  if command -v node &>/dev/null; then
+    val=$(node -p "try { const p = require('./package.json'); (p && p['$field']) ? String(p['$field']) : '' } catch(e) { '' }" 2>/dev/null || true)
+  fi
+
+  if [[ -z "$val" ]] && command -v python3 &>/dev/null; then
+    val=$(python3 -c "import json, sys; 
+try:
+    with open('package.json') as f:
+        v = json.load(f).get('$field')
+        if v: sys.stdout.write(str(v))
+except Exception: pass" 2>/dev/null || true)
+  fi
+
+  if [[ -z "$val" ]]; then
+    val=$(grep -m1 "\"$field\"[[:space:]]*:" package.json 2>/dev/null | sed -E 's/.*"'"$field"'"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)
+  fi
+
+  echo "$val"
+}
+
+# Step 3: Determine repository name
+if [[ -z "$REPO_NAME" ]]; then
+  PKG_NAME=$(get_package_json_field "name")
+
+  if [[ -n "$PKG_NAME" ]]; then
+    # If scoped package like @scope/my-app, strip the scope for GitHub repo name
+    CLEAN_PKG_NAME="${PKG_NAME##*/}"
+    SUGGESTED_NAME=$(echo "$CLEAN_PKG_NAME" | tr ' ' '-' | tr -cd '[:alnum:]-_.')
+    SOURCE_LABEL="package.json"
+  else
+    DIR_NAME=$(basename "$PWD")
+    # Sanitize name for github (letters, numbers, hyphens, underscores, dots)
+    SUGGESTED_NAME=$(echo "$DIR_NAME" | tr ' ' '-' | tr -cd '[:alnum:]-_.')
+    SOURCE_LABEL="folder name"
+  fi
+
+  # Auto-detect description from package.json if not already provided
+  if [[ -z "$DESCRIPTION" ]]; then
+    PKG_DESC=$(get_package_json_field "description")
+    if [[ -n "$PKG_DESC" ]]; then
+      DESCRIPTION="$PKG_DESC"
+      info "Detected description from package.json: \"${DESCRIPTION}\""
+    fi
+  fi
+  
+  if [[ "$ASSUME_YES" = false ]] && [ -t 0 ]; then
+    echo "${BOLD}Publishing to GitHub as ${GREEN}${GITHUB_USER}${NC}"
+    printf "Repository name (from %s) [%s]: " "$SOURCE_LABEL" "$SUGGESTED_NAME"
+    read -r input_name
+    REPO_NAME="${input_name:-$SUGGESTED_NAME}"
+  else
+    REPO_NAME="$SUGGESTED_NAME"
+  fi
+fi
+
+# Step 4: Determine visibility
+if [[ -z "$VISIBILITY" ]]; then
+  if [[ "$ASSUME_YES" = false ]] && [ -t 0 ]; then
+    echo "Choose visibility:"
+    echo "  1) Public (default)"
+    echo "  2) Private"
+    printf "Enter choice [1]: "
+    read -r vis_choice
+    case "$vis_choice" in
+      2|private|Private) VISIBILITY="private" ;;
+      *) VISIBILITY="public" ;;
+    esac
+  else
+    VISIBILITY="public"
+  fi
+fi
+
+# Step 5: Initialize Git if not inside a git repository
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  info "Initializing new git repository..."
+  git init
+  success "Initialized local git repository."
+fi
+
+# Step 6: Ensure branch is renamed to main
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || true)
+if [[ -z "$CURRENT_BRANCH" || "$CURRENT_BRANCH" != "main" ]]; then
+  git branch -M main
+  info "Branch set to ${BOLD}main${NC}."
+fi
+
+# Step 7: Check commits or staged/unstaged changes
+HAS_COMMITS=true
+if ! git rev-parse --verify HEAD &>/dev/null; then
+  HAS_COMMITS=false
+fi
+
+# Check if there are untracked or modified files
+HAS_CHANGES=false
+if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+  HAS_CHANGES=true
+fi
+
+if [[ "$HAS_COMMITS" = false ]]; then
+  if [[ "$HAS_CHANGES" = true ]]; then
+    info "No commits yet. Staging changes and committing..."
+    git add -A
+    git commit -m "$COMMIT_MSG"
+    success "Created initial commit: \"$COMMIT_MSG\""
+  else
+    # Repository directory is completely empty
+    warn "Directory is empty. Creating default README.md..."
+    echo "# $REPO_NAME" > README.md
+    git add README.md
+    git commit -m "Initial commit"
+    success "Created README.md and initial commit."
+  fi
+elif [[ "$HAS_CHANGES" = true ]]; then
+  # There are commits already, but unstaged changes exist
+  if [[ "$ASSUME_YES" = false ]] && [ -t 0 ]; then
+    printf "Uncommitted changes detected. Stage and commit them? [y/N] "
+    read -r commit_choice
+    if [[ "$commit_choice" =~ ^[Yy]$ ]]; then
+      git add -A
+      git commit -m "$COMMIT_MSG"
+      success "Committed changes: \"$COMMIT_MSG\""
+    fi
+  fi
+fi
+
+# Step 8: Create GitHub repository if it doesn't already exist
+REMOTE_EXISTS=false
+if gh repo view "${GITHUB_USER}/${REPO_NAME}" &>/dev/null; then
+  REMOTE_EXISTS=true
+  warn "Remote repository ${BOLD}${GITHUB_USER}/${REPO_NAME}${NC} already exists on GitHub."
+else
+  info "Creating GitHub repository ${BOLD}${GITHUB_USER}/${REPO_NAME}${NC} (${VISIBILITY})..."
+  GH_CREATE_CMD=("gh" "repo" "create" "${GITHUB_USER}/${REPO_NAME}" "--${VISIBILITY}")
+  if [[ -n "$DESCRIPTION" ]]; then
+    GH_CREATE_CMD+=("-d" "$DESCRIPTION")
+  fi
+  "${GH_CREATE_CMD[@]}"
+  success "Created remote repository on GitHub!"
+fi
+
+# Step 9: Configure remote origin
+if [[ "$PROTOCOL" == "ssh" ]]; then
+  REMOTE_URL="git@github.com:${GITHUB_USER}/${REPO_NAME}.git"
+  PROTO_UPPER="SSH"
+else
+  REMOTE_URL="https://github.com/${GITHUB_USER}/${REPO_NAME}.git"
+  PROTO_UPPER="HTTPS"
+fi
+
+if git remote get-url origin &>/dev/null; then
+  EXISTING_URL=$(git remote get-url origin)
+  if [[ "$EXISTING_URL" != "$REMOTE_URL" ]]; then
+    info "Updating remote 'origin' from ${EXISTING_URL} to ${REMOTE_URL}..."
+    git remote set-url origin "$REMOTE_URL"
+  fi
+else
+  info "Adding remote origin: ${REMOTE_URL}"
+  git remote add origin "$REMOTE_URL"
+fi
+success "Remote origin configured (${PROTO_UPPER}): ${REMOTE_URL}"
+
+# Step 10: Push to main
+info "Pushing to origin main..."
+git push -u origin main
+
+echo ""
+echo "${GREEN}=====================================================${NC}"
+success "Successfully published ${BOLD}${REPO_NAME}${NC} to GitHub!"
+echo "${BLUE}➜ Repository URL:${NC} https://github.com/${GITHUB_USER}/${REPO_NAME}"
+echo "${BLUE}➜ Remote Clone:${NC}   ${REMOTE_URL}"
+echo "${GREEN}=====================================================${NC}"

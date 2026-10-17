@@ -1,0 +1,21 @@
+{
+  "name": "git-publish",
+  "version": "1.0.0",
+  "description": "CLI tool to automatically create a GitHub repository, configure main branch, and publish",
+  "main": "git-publish",
+  "bin": {
+    "git-publish": "./git-publish"
+  },
+  "scripts": {
+    "install": "./install.sh"
+  },
+  "keywords": [
+    "git",
+    "github",
+    "cli",
+    "publish",
+    "automation"
+  ],
+  "author": "BayramovNicat",
+  "license": "MIT"
+}
